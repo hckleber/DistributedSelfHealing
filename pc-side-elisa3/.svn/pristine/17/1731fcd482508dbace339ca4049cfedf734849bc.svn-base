@@ -1,0 +1,265 @@
+#include <stdio.h>
+#include <sys/types.h>
+#include "windows.h"
+
+#include "libusb.h"
+
+#define NUM_ROBOTS 4
+
+#define PAYLOAD_SIZE 6
+#define PACKETS_SIZE PAYLOAD_SIZE*NUM_ROBOTS
+// packet:
+// -----------------------------------
+// R | B | G | IR/flags | Right | Left
+// -----------------------------------
+// packet content:
+// R, B, G: values from 0 (OFF) to 100 (ON max power)
+// IR/flags:
+// - first two bits are dedicated to the IRs:
+// 0x00 => all IRs off
+// 0x01 => back IR on
+// 0x02 => front IRs on
+// 0x03 => all IRs on
+// - third bit is reserved for enabling/disablng IR remote control (0=>diabled, 1=>enabled)
+// - fourth bit is reserved for sleep (1 => go to sleep for 1 minute)
+// Right, Left: speed (in percentage); MSBit indicate direction: 1=forward, 0=backward; values from 0 to 100
+
+#define OVERHEAD_SIZE 2*NUM_ROBOTS+1
+// overhead content :
+// - command: 1 byte, indicates which command the payload refer to
+// - address: 2 bytes per robot
+
+
+static struct libusb_device_handle *devh = NULL;
+
+static int find_nrf_device(void)
+{
+	devh = libusb_open_device_with_vid_pid(NULL, 0x1915, 0x0101);
+	return devh ? 0 : -1;
+}
+
+int usb_send(char* data, int nbytes) {
+
+	int transferred = 0;
+	int r = 0;
+
+	r = libusb_bulk_transfer(devh, 0x01, data, 64, &transferred, 5000); // address 0x01
+	if (r < 0) {
+		fprintf(stderr, "bulk write error %d\n", r);
+		return r;
+	}
+	if (transferred < nbytes) {
+		fprintf(stderr, "short write (%d)\n", r);
+		return -1;
+	}
+
+	return 0;
+
+}
+
+int usb_receive(char* data, int nbytes) {
+
+	int received = 0;
+	int r = 0;
+
+	r = libusb_bulk_transfer(devh, 0x81, data, nbytes, &received, 5000);
+	if (r < 0) {
+		fprintf(stderr, "bulk read error %d\n", r);
+		return r;
+	}
+	if (received < nbytes) {
+		fprintf(stderr, "short read (%d)\n", r);
+		return -1;
+	}
+
+    return 0;
+
+}
+
+int main(void) {
+
+	int r;
+	unsigned int i,j,k;
+    char RX_buffer[64];         // Last packet received from base station
+    char TX_buffer[64];         // Next packet to send to base station
+    char lspeed=0, rspeed=0;
+    unsigned int proxValue[8] = {0};
+    unsigned int proxValueAmbient[8] = {0};
+    unsigned int groundValue[4] = {0};
+    unsigned int groundValueAmbient[4] = {0};
+    unsigned int batteryLevel = 0;
+    signed int accX=0, accY=0, accZ=0;
+    unsigned char selector=0, tvRemote=0, flags=0;
+
+	r = libusb_init(NULL);
+	if (r < 0)
+		return r;
+
+	r = find_nrf_device();
+	if (r < 0) {
+		fprintf(stderr, "Could not find/open device\n");
+	}
+
+	r = libusb_claim_interface(devh, 0);
+	if (r < 0) {
+		fprintf(stderr, "usb_claim_interface error %d\n", r);
+	}
+	printf("claimed interface\n");
+
+
+    //SEND_PACKET FRAME: CMD | PLOAD | ADDRESS
+    TX_buffer[0]=0x27; // Change state of the robot;
+
+    lspeed = 0;
+    rspeed = 0;
+
+    i=0;
+    while(1) {
+
+        i = (i+1)%100;  // use to change the rgb leds
+
+        // first robot
+        TX_buffer[(0*8)+1] = i%100;                 // R
+        TX_buffer[(0*8)+2] = i%100;                 // B
+        TX_buffer[(0*8)+3] = i%100;                 // G
+        // TX_buffer[(0*8)+4] = 0x08;               // go to sleep => not yet implemented on Elisa 3
+        TX_buffer[(0*8)+4] = 0x04;                  // activate IR remote control
+        TX_buffer[(0*8)+5] = lspeed&0xFF | 0x80;    // speed right (in percentage)
+        TX_buffer[(0*8)+6] = lspeed&0xFF | 0x80;    // speed left (in percentage)
+        TX_buffer[(0*8)+7] = (3200>>8)&0xFF;        // address of the robot
+        TX_buffer[(0*8)+8] = 3200&0xFF;
+
+        // second robot
+        TX_buffer[(0*8)+1] = i%100;                 // R
+        TX_buffer[(0*8)+2] = 0;                     // B
+        TX_buffer[(0*8)+3] = 0;                     // G
+        // TX_buffer[(0*8)+4] = 0x08;               // go to sleep => not yet implemented on Elisa 3
+        TX_buffer[(0*8)+4] = 0x04;                  // activate IR remote control
+        TX_buffer[(0*8)+5] = 0&0xFF | 0x80;         // speed right (in percentage)
+        TX_buffer[(0*8)+6] = 0&0xFF | 0x80;         // speed left (in percentage)
+        TX_buffer[(0*8)+7] = (3201>>8)&0xFF;        // address of the robot
+        TX_buffer[(0*8)+8] = 3201&0xFF;
+
+        // third robot
+        TX_buffer[(0*8)+1] = 0;                     // R
+        TX_buffer[(0*8)+2] = i%100;                 // B
+        TX_buffer[(0*8)+3] = 0;                     // G
+        // TX_buffer[(0*8)+4] = 0x08;               // go to sleep => not yet implemented on Elisa 3
+        TX_buffer[(0*8)+4] = 0x04;                  // activate IR remote control
+        TX_buffer[(0*8)+5] = 0&0xFF | 0x80;         // speed right (in percentage)
+        TX_buffer[(0*8)+6] = 0&0xFF | 0x80;         // speed left (in percentage)
+        TX_buffer[(0*8)+7] = (3202>>8)&0xFF;        // address of the robot
+        TX_buffer[(0*8)+8] = 3202&0xFF;
+
+        // fourth robot
+        TX_buffer[(0*8)+1] = 0;                     // R
+        TX_buffer[(0*8)+2] = 0;                     // B
+        TX_buffer[(0*8)+3] = i%100;                 // G
+        // TX_buffer[(0*8)+4] = 0x08;               // go to sleep => not yet implemented on Elisa 3
+        TX_buffer[(0*8)+4] = 0x04;                  // activate IR remote control
+        TX_buffer[(0*8)+5] = 0&0xFF | 0x80;         // speed right (in percentage)
+        TX_buffer[(0*8)+6] = 0&0xFF | 0x80;         // speed left (in percentage)
+        TX_buffer[(0*8)+7] = (3203>>8)&0xFF;        // address of the robot
+        TX_buffer[(0*8)+8] = 3203&0xFF;
+
+
+        // transfer the data to the base-station
+        r = usb_send(TX_buffer, PACKETS_SIZE+OVERHEAD_SIZE);
+        if(r < 0) {
+            printf("send error!\n");
+        }
+
+        RX_buffer[0] = 0;
+        RX_buffer[1] = 0;
+        RX_buffer[2] = 0;
+        RX_buffer[3] = 0;
+        r = usb_receive(RX_buffer, 64);     // receive the ack payload for 4 robots at a time (16 bytes for each one)
+        if(r < 0) {
+            printf("receive error!\n");
+        }
+
+        // the base-station returns this "error" codes:
+        // - 0 => transmission succeed (no ack received though)
+        // - 1 => ack received (should not be returned because if the ack is received, then the payload is read)
+        // - 2 => transfer failed
+        if((int)((unsigned char)RX_buffer[0]) <= 2 ) { // if something goes wrong skip the data
+            continue;
+        }
+
+        // extract the sensors data for the first robot based on the packet id (first byte):
+        // id=3 | prox0         | prox1         | prox2         | prox3         | prox5         | prox6         | prox7         | flags
+        // id=4 | prox4         | gound0        | ground1       | ground2       | ground3       | accX          | accY          | tv remote
+        // id=5 | proxAmbient0  | proxAmbient1  | proxAmbient2  | proxAmbient3  | proxAmbient5  | proxAmbient6  | proxAmbient7  | selector
+        // id=6 | proxAmbient4  | goundAmbient0 | goundAmbient1 | goundAmbient2 | goundAmbient3 | accZ          | battery       | free byte
+
+        switch((int)((unsigned char)RX_buffer[0])) {
+
+            case 3:
+                for(j=1; j<8; j++) {
+                    proxValue[j-1] = (int)((unsigned char)RX_buffer[j*2-1]) + ((int)((unsigned char)RX_buffer[j*2]))*256;
+                }
+                flags = (unsigned char)RX_buffer[15];
+                break;
+
+            case 4:
+                proxValue[7] = (int)((unsigned char)RX_buffer[1]) + ((int)((unsigned char)RX_buffer[2]))*256;
+                groundValue[0] = (int)((unsigned char)RX_buffer[3]) + ((int)((unsigned char)RX_buffer[4]))*256;
+                groundValue[1] = (int)((unsigned char)RX_buffer[5]) + ((int)((unsigned char)RX_buffer[6]))*256;
+                groundValue[2] = (int)((unsigned char)RX_buffer[7]) + ((int)((unsigned char)RX_buffer[8]))*256;
+                groundValue[3] = (int)((unsigned char)RX_buffer[9]) + ((int)((unsigned char)RX_buffer[10]))*256;
+                accX = (int)((unsigned char)RX_buffer[11]) + ((int)((char)RX_buffer[12]))*256;
+                accY = (int)((unsigned char)RX_buffer[13]) + ((int)((char)RX_buffer[14]))*256;
+                tvRemote = (unsigned char)RX_buffer[15];
+                break;
+
+            case 5:
+                for(j=1; j<8; j++) {
+                    proxValueAmbient[j-1] = (int)((unsigned char)RX_buffer[j*2-1]) + ((int)((unsigned char)RX_buffer[j*2]))*256;
+                }
+                selector = (unsigned char)RX_buffer[15];
+                break;
+                break;
+
+            case 6:
+                proxValueAmbient[7] = (int)((unsigned char)RX_buffer[1]) + ((int)((unsigned char)RX_buffer[2]))*256;
+                groundValueAmbient[0] = (int)((unsigned char)RX_buffer[3]) + ((int)((unsigned char)RX_buffer[4]))*256;
+                groundValueAmbient[1] = (int)((unsigned char)RX_buffer[5]) + ((int)((unsigned char)RX_buffer[6]))*256;
+                groundValueAmbient[2] = (int)((unsigned char)RX_buffer[7]) + ((int)((unsigned char)RX_buffer[8]))*256;
+                groundValueAmbient[3] = (int)((unsigned char)RX_buffer[9]) + ((int)((unsigned char)RX_buffer[10]))*256;
+                accZ = (int)((unsigned char)RX_buffer[11]) + ((int)((char)RX_buffer[12]))*256;
+                batteryLevel = (int)((unsigned char)RX_buffer[13]) + ((int)((unsigned char)RX_buffer[14]))*256;
+                // RX_buffer[15] is free
+                break;
+
+        }
+
+        system( "cls" );
+        printf("Proximity\n");
+        printf("%d\t %d\t %d\t %d\t %d\t %d\t %d\t %d\n", proxValue[0], proxValue[1], proxValue[2], proxValue[3], proxValue[4], proxValue[5], proxValue[6], proxValue[7]);
+        printf("Proximity ambient\n");
+        printf("%d\t %d\t %d\t %d\t %d\t %d\t %d\t %d\n", proxValueAmbient[0], proxValueAmbient[1], proxValueAmbient[2], proxValueAmbient[3], proxValueAmbient[4], proxValueAmbient[5], proxValueAmbient[6], proxValueAmbient[7]);
+        printf("Ground\n");
+        printf("%d\t %d\t %d\t %d\n", groundValue[0], groundValue[1], groundValue[2], groundValue[3]);
+        printf("Ground ambient");
+        printf("%d\t %d\t %d\t %d\n", groundValueAmbient[0], groundValueAmbient[1], groundValueAmbient[2], groundValueAmbient[3]);
+        printf("Accelerometer\n");
+        printf("%d\t %d\t %d\n", accX, accY, accZ);
+        printf("Battery\n");
+        printf("%d\n", batteryLevel);
+        printf("Flags\n");
+        printf("%x\n", flags);
+        printf("Tv remote\n");
+        printf("%d\n", tvRemote);
+        printf("Selector\n");
+        printf("%d\n", selector);
+
+    }
+
+	libusb_release_interface(devh, 0);
+	libusb_close(devh);
+	libusb_exit(NULL);
+
+	return 0;
+
+}
+

@@ -1,0 +1,43 @@
+# depslib dependency file v1.0
+1311662802 source:h:\lavoro\local-repo\newpuck-working\nrf24lu1\send-data\main.c
+	<stdio.h>
+	<sys/types.h>
+	"windows.h"
+	"libusb.h"
+
+1311758764 source:g:\lavoro\local-repo\newpuck-working\nrf24lu1\send-data\main.c
+	<stdio.h>
+	<sys/types.h>
+	"windows.h"
+	"libusb.h"
+
+1314695436 source:h:\lavoro\local-repo\newpuck-working\nrf24lu1\copia di send-data\main.c
+	<stdio.h>
+	<sys/types.h>
+	"windows.h"
+	"libusb.h"
+
+1322579750 source:h:\lavoro\local-repo\newpuck-working\nrf24lu1\send-data-ack16\main.c
+	<stdio.h>
+	<sys/types.h>
+	"windows.h"
+	"libusb.h"
+
+1323847752 source:e:\lavoro\local-repo\newpuck-working\nrf24lu1\send-data-ack16\main.c
+	<stdio.h>
+	<sys/types.h>
+	"windows.h"
+	"libusb.h"
+
+1324313626 source:e:\lavoro\local-repo\newpuck-working\nrf24lu1\send-data-ack16-single-robot\main.c
+	<stdio.h>
+	<sys/types.h>
+	"windows.h"
+	"libusb.h"
+
+1324550880 source:h:\lavoro\local-repo\newpuck-working\nrf24lu1\send-data-ack16-single-robot\main.c
+	<stdio.h>
+	<sys/types.h>
+	"windows.h"
+	"libusb.h"
+

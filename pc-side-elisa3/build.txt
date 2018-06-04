@@ -1,0 +1,11 @@
+LINUX:
+- required: libusb-1.0, libusb-1.0-dev, libncurses5, libncurses5-dev
+gcc -o main_linux main.c -lusb-1.0 -lncurses -lm
+sudo ./main_linux 3200
+
+MAC OS X:
+gcc main.c -o main_mac -I/opt/local/include/libusb-1.0 -L/opt/local/lib -lusb-1.0 -lncurses -lm
+./main_mac 3200
+
+WINDOWS:
+codeblocks

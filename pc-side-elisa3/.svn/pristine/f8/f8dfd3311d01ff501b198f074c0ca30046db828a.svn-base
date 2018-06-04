@@ -1,0 +1,1021 @@
+#include <stdio.h>
+#include <sys/types.h>
+#include <math.h>
+
+#ifdef __linux__
+    #include <qlibusb-1.0/libusb.h>
+    #include <ncurses.h>
+#endif
+
+#ifdef __APPLE__
+#include <libusb.h>
+#include <ncurses.h>
+#endif
+
+#ifdef _WIN32
+    #include "windows.h"
+    #include "libusb.h"
+#endif
+
+// macro for handling flags byte
+#define FRONT_IR_ON(x) ((x) |= (1 << 1))
+#define BACK_IR_ON(x) ((x) |= (1 << 0))
+#define ALL_IR_ON(x) ((x) |= (1<<0) | (1 << 1))
+#define TV_REMOTE_ON(x) ((x) |= (1<<2))
+#define SLEEP_ON(x) ((x) = 0x08)
+#define CALIBRATION_ON(x) ((x) |= (1<<4))
+#define OBSTACLE_AVOID_ON(x) ((x) |= (1<<6))
+#define CLIFF_AVOID_ON(x) ((x) |= (1<<7))
+#define FRONT_IR_OFF(x) ((x) &= ~(1 << 1))
+#define BACK_IR_OFF(x) ((x) &= ~(1 << 0))
+#define ALL_IR_OFF(x) ((x) &= ~(1 << 0) & ~(1 << 1))
+#define TV_REMOTE_OFF(x) ((x) &= ~(1 << 2))
+#define SLEEP_OFF(x) ((x) &= ~(1 << 3))
+#define CALIBRATION_OFF(x) ((x) &= ~(1 << 4))
+#define OBSTACLE_AVOID_OFF(x) ((x) &= ~(1 << 6))
+#define CLIFF_AVOID_OFF(x) ((x) &= ~(1 << 7))
+
+#define RAD_2_DEG 57.2957796
+
+#define NUM_ROBOTS 4
+#define PAYLOAD_SIZE 13
+#define ADDR_SIZE 2
+#define ROBOT_PACKET_SIZE (PAYLOAD_SIZE+ADDR_SIZE)
+#define PACKETS_SIZE 64
+#define OVERHEAD_SIZE (2*NUM_ROBOTS+1)
+#define UNUSED_BYTES 3
+
+// The usb buffer between the pc and the base-station is 64 bytes.
+// Each packet exchanged with the bast-station must contain as the
+// first byte the "command id" that at the moment can be either
+// "change robot state" (0x27) or "goto base-station bootloader" (0x28).
+// In order to optimize the throughput the packet exchanged with the radio
+// base-station contains informations to send to four different robots
+// simultaneously.
+// Each robot must be identified by a 2 byte address, thus we have:
+// 64 - 1 - 2*4 = 55 / 4 = 13 bytes usable for the payload of each robot.
+//
+// Payload content for each robot:
+// --------------------------------------------------------------------------
+// R | B | G | IR/flags | Right | Left | Leds | ...remaining 6 bytes not used
+// --------------------------------------------------------------------------
+//
+// * R, B, G: values from 0 (OFF) to 100 (ON max power)
+// * IR/flags:
+//   - first two bits are dedicated to the IRs:
+//     0x00 => all IRs off
+//     0x01 => back IR on
+//     0x02 => front IRs on
+//     0x03 => all IRs on
+//   - third bit is used for enabling/disablng IR remote control (0=>diabled, 1=>enabled)
+//   - fourth bit is used for sleep (1 => go to sleep for 1 minute)
+//   - fifth bit is used to calibrate all sensors (proximity, ground, accelerometer)
+//   - sixth bits is reserved (used by radio station)
+//   - seventh bit is used for enabling/disabling onboard obstacle avoidance
+//   - eight bit is used for enabling/disabling onboard cliff avoidance
+// * Right, Left: speed (in percentage); MSBit indicate direction: 1=forward, 0=backward; values from 0 to 100
+// * Leds: each bit define whether the corresponding led is turned on (1) or off(0); e.g. if bit0=1 then led0=on
+// * remaining bytes free to be used
+//
+// Overhead content :
+// - command: 1 byte, indicates which command the packet refer to
+// - address: 2 bytes per robot
+
+
+int current_address = 0;
+
+static struct libusb_device_handle *devh = NULL;
+
+static int find_nrf_device(void)
+{
+	devh = (libusb_device_handle*)libusb_open_device_with_vid_pid(NULL, 0x1915, 0x0101);
+	return devh ? 0 : -1;
+}
+
+int usb_send(char* data, int nbytes) {
+
+	int transferred = 0;
+	int r = 0;
+
+	r = libusb_bulk_transfer(devh, 0x01, data, 64, &transferred, 5000); // address 0x01
+	if (r < 0) {
+		fprintf(stderr, "bulk write error %d\n", r);
+		return r;
+	}
+	if (transferred < nbytes) {
+		fprintf(stderr, "short write (%d)\n", r);
+		return -1;
+	}
+
+	return 0;
+
+}
+
+int usb_receive(char* data, int nbytes) {
+
+	int received = 0;
+	int r = 0;
+
+	r = libusb_bulk_transfer(devh, 0x81, data, nbytes, &received, 5000);
+	if (r < 0) {
+		fprintf(stderr, "bulk read error %d\n", r);
+		return r;
+	}
+	if (received < nbytes) {
+		fprintf(stderr, "short read (%d)\n", r);
+		return -1;
+	}
+
+    return 0;
+
+}
+
+char speed(char value) {
+    if(value >= 0) {
+        return (value|0x80);
+    } else {
+        return ((-value)&0x7F);
+    }
+}
+
+#ifdef _WIN32
+void curPos(int x, int y) {
+  HANDLE hStdout;
+  CONSOLE_SCREEN_BUFFER_INFO csbiInfo;
+  hStdout=GetStdHandle(STD_OUTPUT_HANDLE);
+  GetConsoleScreenBufferInfo(hStdout, &csbiInfo);
+  csbiInfo.dwCursorPosition.X=x;
+  csbiInfo.dwCursorPosition.Y=y;
+  SetConsoleCursorPosition(hStdout, csbiInfo.dwCursorPosition);
+}
+#endif
+
+// angle computation with MMAX7455L (calibration done on robot)
+int computeAngle(signed int x, signed int y) {
+
+    int currentAngle = 0;
+
+	currentAngle = (signed int)(atan2f((float)x, (float)y)*RAD_2_DEG);
+
+	if(currentAngle<0) {
+		currentAngle = 360+currentAngle;	// angles from 0 to 360
+	}
+
+    return currentAngle;
+
+}
+
+void printHelp() {
+
+    int ch=0;
+
+#ifdef __linux__
+	clear();
+#endif
+
+#ifdef __APPLE__
+	clear();
+#endif
+
+#ifdef _WIN32
+    system( "cls" );
+#endif
+
+    while(1) {
+
+#ifdef __linux__
+        ch = getch();
+        if (ch != ERR) {
+            if(ch == 'h') {
+                break;
+            }
+        }
+        refresh();
+#endif
+
+#ifdef __APPLE__
+        ch = getch();
+        if (ch != ERR) {
+            if(ch == 'h') {
+                break;
+            }
+        }
+        refresh();
+#endif
+
+#ifdef _WIN32
+        if(GetKeyState (0x48) < 0) {     // 'h'
+                break;
+        }
+        curPos(0,0);
+#endif
+
+        printf("************\n\r");
+        printf("*** HELP ***\n\r");
+        printf("************\n\r");
+        printf("\n\rMOVEMENT: when no key is pressed the speed sent to robot is 0\n\r");
+        printf("+: increase speed used to control the robot\n\r");
+        printf("-: decrease speed used to control the robot\n\r");
+        printf("Arrow up: both motors forward\n\r");
+        printf("Arrow down: both motors backward\n\r");
+        printf("Arrow left: motor right forward\n\r");
+        printf("Arrow right: motor left forward\n\r");
+        printf("a: pivot counterclockwise (motor right forward, motor left backward)\n\r");
+        printf("s: pivot clockwise (motor right backward, motor left forward)\n\r");
+        printf("\n\rRGB COLOR:\n\r");
+        printf("r: red power increase (max 100)\n\r");
+        printf("e: red power decrease (min 0)\n\r");
+        printf("g: green power increase (max 100)\n\r");
+        printf("f: green power decrease (min 0)\n\r");
+        printf("b: blue power increase (max 100)\n\r");
+        printf("v: blue power decrease (min 0)\n\r");
+        if(current_address >= 3204) {
+            printf("\n\rGREEN LEDS:\n\r");
+            printf("c: turn all small green leds on/off (toggle)\n\r");
+        }
+        printf("\n\rFLAGS:\n\r");
+        printf("u: enable/disable tv remote receiver (toggle)\n\r");
+        printf("i: turn all IR emitters on/off (toggle)\n\r");
+        printf("o: enable/disable obstacle avoidance (toggle)\n\r");
+        printf("p: enable/disable cliff avoidance (toggle)\n\r");
+        printf("j: goto sleep (the robot sleep for 1 minute)\n\r");
+        printf("k: calibrate all sensors (proximity, ground, accelerometer)\n\r");
+        printf("\n\rOTHERS:\n\r");
+        printf("spacebar: reset\n\r");
+        printf("h: enter/exit help\n\r");
+        printf("q: quit\n\r");
+        printf("\n\rFLAGS received:\n\r");
+        printf("bit0: 0 = robot not in charge; 1 = robot in charge\n\r");
+        printf("bit1: 0 = button pressed; 1 = button not pressed\n\r");
+        if(current_address >= 3204) {
+            printf("bit2: 0 = robot not charged; 1 = robot charged completely\n\r");
+        }
+        printf("the remainig bits are not used\n\r");
+
+    }
+
+#ifdef __linux__
+	refresh();
+#endif
+
+#ifdef __APPLE__
+    refresh();
+#endif
+
+#ifdef _WIN32
+    system( "cls" );
+#endif
+
+}
+
+int main(int argc, char *argv[]) {
+
+	int r;
+	unsigned int i,j,k,delayCounter=0;
+    char RX_buffer[64]={0};         // Last packet received from base station
+    char TX_buffer[64]={0};         // Next packet to send to base station
+    char lspeed=0, rspeed=0;
+    unsigned int proxValue[8] = {0};
+    unsigned int proxValueAmbient[8] = {0};
+    unsigned int groundValue[4] = {0};
+    unsigned int groundValueAmbient[4] = {0};
+    unsigned int batteryLevel = 0, batteryPercent = 0;
+    signed int accX=0, accY=0, accZ=0;
+    int angle = 0;
+    unsigned char selector=0, tvRemote=0, flags=0;
+    unsigned long int counter = 0;
+    char current_speed=0;
+	char redLed=0, greenLed=0, blueLed=0;
+	unsigned char smallLeds=0;
+	unsigned char flagsTx = 0x00;
+    int ch=0;
+    unsigned char obstacleAvoid=0, cliffAvoid=0, irOn=0, tvOn=0, sleepOn=0, exitProg=0, smallLedsOn=0;
+    signed long int leftMotSteps=0, rightMotSteps=0;
+
+    current_address = atoi(argv[1]);
+
+	r = libusb_init(NULL);
+	if (r < 0)
+		return r;
+	//printf("libusb initialized\n");
+
+	r = find_nrf_device();
+	if (r < 0) {
+		fprintf(stderr, "Could not find/open device\n");
+	}
+	//printf("device found\n");
+
+	r = libusb_claim_interface(devh, 0);
+	if (r < 0) {
+		fprintf(stderr, "usb_claim_interface error %d\n", r);
+	}
+	printf("claimed interface\n");
+
+    TX_buffer[0]=0x27;  // Set command: change robots state
+
+    lspeed = 0;
+    rspeed = 0;
+
+    i=0;
+
+#ifdef __linux__
+    initscr();
+	keypad(stdscr,1);
+    cbreak();
+    noecho();
+    timeout(100); // non-blocking getch()
+#endif
+
+#ifdef __APPLE__
+    initscr();
+	keypad(stdscr,1);
+    cbreak();
+    noecho();
+    timeout(100); // non-blocking getch()
+#endif
+
+
+    while(!exitProg) {
+
+#ifdef __linux__
+        ch = getch();
+        if (ch != ERR) {
+            if(ch == KEY_LEFT) {
+				//printf("left\r\n");
+                rspeed = current_speed;
+                lspeed = 0;
+            } else if(ch == KEY_RIGHT) {
+				//printf("right\r\n");
+                lspeed = current_speed;
+                rspeed = 0;
+            } else if(ch == KEY_DOWN) {
+				//printf("down\r\n");
+                lspeed = -current_speed;
+                rspeed = -current_speed;
+            } else if(ch == KEY_UP) {
+				//printf("up\r\n");
+                lspeed = current_speed;
+                rspeed = current_speed;
+            } else if(ch == '+') {
+				//printf("+\r\n");
+                current_speed += 5;
+                if(current_speed > 100) {
+                    current_speed = 100;
+                }
+            } else if(ch == '-') {
+				//printf("-\r\n");
+                current_speed -= 5;
+                if(current_speed < -100) {
+                    current_speed = -100;
+                }
+            } else if (ch == ' ') {
+                current_speed = 0;
+                redLed = 0;
+                greenLed = 0;
+                blueLed = 0;
+                flagsTx = 0;
+                smallLeds = 0;
+            } else if(ch == 'a') {
+                lspeed = -current_speed;
+                rspeed = current_speed;
+            } else if(ch == 's') {
+                lspeed = current_speed;
+                rspeed = -current_speed;
+            } else if(ch == 'r') {
+				redLed++;
+				if(redLed > 100) {
+					redLed = 100;
+				}
+            } else if(ch == 'e') {
+				redLed--;
+				if(redLed < 0) {
+					redLed = 0;
+				}
+            } else if(ch == 'g') {
+				greenLed++;
+				if(greenLed > 100) {
+					greenLed = 100;
+				}
+            } else if(ch == 'f') {
+				greenLed--;
+				if(greenLed < 0) {
+					greenLed = 0;
+				}
+            } else if(ch == 'b') {
+				blueLed++;
+				if(blueLed > 100) {
+					blueLed = 100;
+				}
+            } else if(ch == 'v') {
+				blueLed--;
+				if(blueLed < 0) {
+					blueLed = 0;
+				}
+            } else if(ch == 'u') {
+                if(tvOn) {
+                    tvOn = 0;
+                    TV_REMOTE_OFF(flagsTx);
+                } else {
+                    tvOn = 1;
+                    TV_REMOTE_ON(flagsTx);
+                }
+            } else if(ch == 'i') {
+                if(irOn) {
+                    irOn = 0;
+                    ALL_IR_OFF(flagsTx);
+                } else {
+                    irOn = 1;
+                    ALL_IR_ON(flagsTx);
+                }
+            } else if(ch == 'o') {
+                if(obstacleAvoid) {
+                    obstacleAvoid = 0;
+                    OBSTACLE_AVOID_OFF(flagsTx);
+                } else {
+                    obstacleAvoid = 1;
+                    OBSTACLE_AVOID_ON(flagsTx);
+                }
+            } else if(ch == 'p') {
+                if(cliffAvoid) {
+                    cliffAvoid = 0;
+                    CLIFF_AVOID_OFF(flagsTx);
+                } else {
+                    cliffAvoid = 1;
+                    CLIFF_AVOID_ON(flagsTx);
+                }
+            } else if(ch == 'j') {
+                //if(sleepOn) {
+                //    sleepOn = 0;
+                //    SLEEP_OFF(flagsTx);
+                //} else {
+                    sleepOn = 1;
+                    SLEEP_ON(flagsTx);
+                //}
+            } else if(ch == 'c') {
+                if(smallLedsOn) {
+                    smallLedsOn = 0;
+                    smallLeds = 0x00;
+                } else {
+                    smallLedsOn = 1;
+                    smallLeds = 0xFF;
+                }
+            } else if(ch == 'k') {
+                CALIBRATION_ON(flagsTx);
+            } else if(ch == 'h') {
+                printHelp();
+            } else if(ch == 'q') {
+                exitProg = 1;
+            } else {
+				//printf("pressed %c\r\n", ch);
+			}
+        } else {
+            rspeed = 0;
+            lspeed = 0;
+        }
+#endif
+
+#ifdef __APPLE__
+        ch = getch();
+        if (ch != ERR) {
+            if(ch == KEY_LEFT) {
+				//printf("left\r\n");
+                rspeed = current_speed;
+                lspeed = 0;
+            } else if(ch == KEY_RIGHT) {
+				//printf("right\r\n");
+                lspeed = current_speed;
+                rspeed = 0;
+            } else if(ch == KEY_DOWN) {
+				//printf("down\r\n");
+                lspeed = -current_speed;
+                rspeed = -current_speed;
+            } else if(ch == KEY_UP) {
+				//printf("up\r\n");
+                lspeed = current_speed;
+                rspeed = current_speed;
+            } else if(ch == '+') {
+				//printf("+\r\n");
+				current_speed += 5;
+                if(current_speed > 100) {
+                    current_speed = 100;
+                }
+            } else if(ch == '-') {
+				//printf("-\r\n");
+                current_speed -= 5;
+                if(current_speed < -100) {
+                    current_speed = -100;
+                }
+            } else if (ch == ' ') {
+                current_speed = 0;
+                redLed = 0;
+                greenLed = 0;
+                blueLed = 0;
+                flagsTx = 0;
+                smallLeds = 0;
+            } else if(ch == 'a') {
+                lspeed = -current_speed;
+                rspeed = current_speed;
+            } else if(ch == 's') {
+                lspeed = current_speed;
+                rspeed = -current_speed;
+            } else if(ch == 'r') {
+				redLed++;
+				if(redLed > 100) {
+					redLed = 100;
+				}
+            } else if(ch == 'e') {
+				redLed--;
+				if(redLed < 0) {
+					redLed = 0;
+				}
+            } else if(ch == 'g') {
+				greenLed++;
+				if(greenLed > 100) {
+					greenLed = 100;
+				}
+            } else if(ch == 'f') {
+				greenLed--;
+				if(greenLed < 0) {
+					greenLed = 0;
+				}
+            } else if(ch == 'b') {
+				blueLed++;
+				if(blueLed > 100) {
+					blueLed = 100;
+				}
+            } else if(ch == 'v') {
+				blueLed--;
+				if(blueLed < 0) {
+					blueLed = 0;
+				}
+            } else if(ch == 'u') {
+                if(tvOn) {
+                    tvOn = 0;
+                    TV_REMOTE_OFF(flagsTx);
+                } else {
+                    tvOn = 1;
+                    TV_REMOTE_ON(flagsTx);
+                }
+            } else if(ch == 'i') {
+                if(irOn) {
+                    irOn = 0;
+                    ALL_IR_OFF(flagsTx);
+                } else {
+                    irOn = 1;
+                    ALL_IR_ON(flagsTx);
+                }
+            } else if(ch == 'o') {
+                if(obstacleAvoid) {
+                    obstacleAvoid = 0;
+                    OBSTACLE_AVOID_OFF(flagsTx);
+                } else {
+                    obstacleAvoid = 1;
+                    OBSTACLE_AVOID_ON(flagsTx);
+                }
+            } else if(ch == 'p') {
+                if(cliffAvoid) {
+                    cliffAvoid = 0;
+                    CLIFF_AVOID_OFF(flagsTx);
+                } else {
+                    cliffAvoid = 1;
+                    CLIFF_AVOID_ON(flagsTx);
+                }
+            } else if(ch == 'j') {
+                //if(sleepOn) {
+                //    sleepOn = 0;
+                //    SLEEP_OFF(flagsTx);
+                //} else {
+                    sleepOn = 1;
+                    SLEEP_ON(flagsTx);
+                //}
+            } else if(ch == 'c') {
+                if(smallLedsOn) {
+                    smallLedsOn = 0;
+                    smallLeds = 0x00;
+                } else {
+                    smallLedsOn = 1;
+                    smallLeds = 0xFF;
+                }
+            } else if(ch == 'k') {
+                CALIBRATION_ON(flagsTx);
+            } else if(ch == 'h') {
+                printHelp();
+            } else if(ch == 'q') {
+                exitProg = 1;
+            } else {
+				//printf("pressed %c\r\n", ch);
+			}
+        } else {
+            rspeed = 0;
+            lspeed = 0;
+        }
+#endif
+
+#ifdef _WIN32
+        delayCounter++;
+        if(delayCounter>10) {   // wait a little from one command to the other
+            delayCounter = 0;
+
+            if (GetKeyState (VK_LEFT) < 0) {
+                //std::cout << "LEFT\n";
+                rspeed = current_speed;
+                lspeed = 0;
+            } else if (GetKeyState (VK_RIGHT) < 0) {
+                //std::cout << "RIGHT\n";
+                lspeed = current_speed;
+                rspeed = 0;
+            } else if (GetKeyState (VK_DOWN) < 0) {
+                //std::cout << "DOWN\n";
+                lspeed = -current_speed;
+                rspeed = -current_speed;
+            } else if (GetKeyState (VK_UP) < 0) {
+                //std::cout << "UP\n";
+                lspeed = current_speed;
+                rspeed = current_speed;
+            } else if (GetKeyState (VK_ADD) < 0) {
+                //std::cout << "UP\n";
+                current_speed += 5;
+                if(current_speed > 100) {
+                    current_speed = 100;
+                }
+            } else if (GetKeyState (VK_SUBTRACT) < 0) {
+                //std::cout << "UP\n";
+                current_speed -= 5;
+                if(current_speed < -100) {
+                    current_speed = -100;
+                }
+            } else if (GetKeyState (VK_SPACE) < 0) {
+                current_speed = 0;
+                redLed = 0;
+                greenLed = 0;
+                blueLed = 0;
+                flagsTx = 0;
+                smallLeds = 0;
+            } else if (GetKeyState (0x41) < 0) {    // 'a'
+                lspeed = -current_speed;
+                rspeed = current_speed;
+            } else if (GetKeyState (0x53) < 0) {    // 's'
+                lspeed = current_speed;
+                rspeed = -current_speed;
+            } else if (GetKeyState (0x52) < 0) {    // 'r'
+                redLed++;
+                if(redLed > 100) {
+                    redLed = 100;
+                }
+            } else if (GetKeyState (0x45) < 0) {    // 'e'
+                redLed--;
+                if(redLed < 0) {
+                    redLed = 0;
+                }
+            } else if (GetKeyState (0x47) < 0) {    // 'g'
+                greenLed++;
+                if(greenLed > 100) {
+                    greenLed = 100;
+                }
+            } else if (GetKeyState (0x46) < 0) {    // 'f'
+                greenLed--;
+                if(greenLed < 0) {
+                    greenLed = 0;
+                }
+            } else if (GetKeyState (0x42) < 0) {    // 'b'
+                blueLed++;
+                if(blueLed > 100) {
+                    blueLed = 100;
+                }
+            } else if (GetKeyState (0x56) < 0) {    // 'v'
+                blueLed--;
+                if(blueLed < 0) {
+                    blueLed = 0;
+                }
+            } else if(GetKeyState (0x55) < 0) {     // 'u'
+                if(tvOn) {
+                    tvOn = 0;
+                    TV_REMOTE_OFF(flagsTx);
+                } else {
+                    tvOn = 1;
+                    TV_REMOTE_ON(flagsTx);
+                }
+            } else if (GetKeyState (0x49) < 0) {    // 'i'
+                if(irOn) {
+                    irOn = 0;
+                    ALL_IR_OFF(flagsTx);
+                } else {
+                    irOn = 1;
+                    ALL_IR_ON(flagsTx);
+                }
+            } else if(GetKeyState (0x4f) < 0) {     // 'o'
+                if(obstacleAvoid) {
+                    obstacleAvoid = 0;
+                    OBSTACLE_AVOID_OFF(flagsTx);
+                } else {
+                    obstacleAvoid = 1;
+                    OBSTACLE_AVOID_ON(flagsTx);
+                }
+            } else if(GetKeyState (0x50) < 0) {     // 'p'
+                if(cliffAvoid) {
+                    cliffAvoid = 0;
+                    CLIFF_AVOID_OFF(flagsTx);
+                } else {
+                    cliffAvoid = 1;
+                    CLIFF_AVOID_ON(flagsTx);
+                }
+            } else if(GetKeyState (0x4a) < 0) {     // 'j'
+                //if(sleepOn) {
+                //    sleepOn = 0;
+                //    SLEEP_OFF(flagsTx);
+                //} else {
+                    sleepOn = 1;
+                    SLEEP_ON(flagsTx);
+                //}
+            } else if(GetKeyState (0x43) < 0) {     // 'c'
+                if(smallLedsOn) {
+                    smallLedsOn = 0;
+                    smallLeds = 0x00;
+                } else {
+                    smallLedsOn = 1;
+                    smallLeds = 0xFF;
+                }
+            } else if(GetKeyState (0x4b) < 0) {     // 'k'
+                CALIBRATION_ON(flagsTx);
+            } else if(GetKeyState (0x48) < 0) {     // 'h'
+                printHelp();
+            } else if(GetKeyState (0x51) < 0) {     // 'q'
+                exitProg = 1;
+            } else {
+                rspeed = 0;
+                lspeed = 0;
+            }
+
+        }
+
+#endif
+
+
+        if(sleepOn) {           // the sleep command requires that all the others bytes are zero
+
+            // first robot
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+1] = 0x00;                          // R
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+2] = 0x00;				            // B
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+3] = 0x00;                          // G
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+4] = flagsTx;                       // activate IR remote control
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+5] = 0x00;                          // speed right (in percentage)
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+6] = 0x00;                          // speed left (in percentage)
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+7] = 0x00;                          // small green leds
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+14] = (current_address>>8)&0xFF;     // address of the robot
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+15] = current_address&0xFF;
+
+            // second robot
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+1] = 0x00;                          // R
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+2] = 0x00;				            // B
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+3] = 0x00;                          // G
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+4] = flagsTx;                       // activate IR remote control
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+5] = 0x00;                          // speed right (in percentage)
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+6] = 0x00;                          // speed left (in percentage)
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+7] = 0x00;                          // small green leds
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+14] = ((current_address+1)>>8)&0xFF; // address of the robot
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+15] = (current_address+1)&0xFF;
+
+            // third robot
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+1] = 0x00;                          // R
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+2] = 0x00;				            // B
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+3] = 0x00;                          // G
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+4] = flagsTx;                       // activate IR remote control
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+5] = 0x00;                          // speed right (in percentage)
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+6] = 0x00;                          // speed left (in percentage)
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+7] = 0x00;                          // small green leds
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+14] = ((current_address+2)>>8)&0xFF; // address of the robot
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+15] = (current_address+2)&0xFF;
+
+            // fourth robot
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+1] = 0x00;                          // R
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+2] = 0x00;				            // B
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+3] = 0x00;                          // G
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+4] = flagsTx;                       // activate IR remote control
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+5] = 0x00;                          // speed right (in percentage)
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+6] = 0x00;                          // speed left (in percentage)
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+7] = 0x00;                          // small green leds
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+14] = ((current_address+3)>>8)&0xFF; // address of the robot
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+15] = (current_address+3)&0xFF;
+
+        } else {
+
+            // first robot
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+1] = redLed;                        // R
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+2] = blueLed;				        // B
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+3] = greenLed;                      // G
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+4] = flagsTx;                       // activate IR remote control
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+5] = speed(rspeed);                 // speed right (in percentage)
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+6] = speed(lspeed);                 // speed left (in percentage)
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+7] = smallLeds;                     // small green leds
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+14] = (current_address>>8)&0xFF;     // address of the robot
+            TX_buffer[(0*ROBOT_PACKET_SIZE)+15] = current_address&0xFF;
+
+            // second robot
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+1] = redLed;                        // R
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+2] = blueLed;				        // B
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+3] = greenLed;                      // G
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+4] = flagsTx;                       // activate IR remote control
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+5] = speed(rspeed);                 // speed right (in percentage)
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+6] = speed(lspeed);                 // speed left (in percentage)
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+7] = smallLeds;                     // small green leds
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+14] = ((current_address+1)>>8)&0xFF; // address of the robot
+            TX_buffer[(1*ROBOT_PACKET_SIZE)+15] = (current_address+1)&0xFF;
+
+            // third robot
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+1] = redLed;                        // R
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+2] = blueLed;				        // B
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+3] = greenLed;                      // G
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+4] = flagsTx;                       // activate IR remote control
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+5] = speed(rspeed);                 // speed right (in percentage)
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+6] = speed(lspeed);                 // speed left (in percentage)
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+7] = smallLeds;                     // small green leds
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+14] = ((current_address+2)>>8)&0xFF; // address of the robot
+            TX_buffer[(2*ROBOT_PACKET_SIZE)+15] = (current_address+2)&0xFF;
+
+            // fourth robot
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+1] = redLed;                        // R
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+2] = blueLed;				        // B
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+3] = greenLed;                      // G
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+4] = flagsTx;                       // activate IR remote control
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+5] = speed(rspeed);                 // speed right (in percentage)
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+6] = speed(lspeed);                 // speed left (in percentage)
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+7] = smallLeds;                     // small green leds
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+14] = ((current_address+3)>>8)&0xFF; // address of the robot
+            TX_buffer[(3*ROBOT_PACKET_SIZE)+15] = (current_address+3)&0xFF;
+        }
+
+        // transfer the data to the base-station
+        r = usb_send(TX_buffer, PACKETS_SIZE-UNUSED_BYTES);
+        if(r < 0) {
+            printf("send error!\n");
+        }
+
+        RX_buffer[0] = 0;
+        RX_buffer[1] = 0;
+        RX_buffer[2] = 0;
+        RX_buffer[3] = 0;
+        r = usb_receive(RX_buffer, 64);     // receive the ack payload for 4 robots at a time (16 bytes for each one)
+        if(r < 0) {
+            printf("receive error!\n");
+        }
+
+        // the base-station returns this "error" codes:
+        // - 0 => transmission succeed (no ack received though)
+        // - 1 => ack received (should not be returned because if the ack is received, then the payload is read)
+        // - 2 => transfer failed
+        if((int)((unsigned char)RX_buffer[0]) <= 2 ) { // if something goes wrong skip the data
+            //printf("Communication problems: %d\n", RX_buffer[0]);
+            continue;
+        }
+
+        // extract the sensors data for the first robot based on the packet id (first byte):
+        // id=3 | prox0         | prox1         | prox2         | prox3         | prox5         | prox6         | prox7         | flags
+        // id=4 | prox4         | gound0        | ground1       | ground2       | ground3       | accX          | accY          | tv remote
+        // id=5 | proxAmbient0  | proxAmbient1  | proxAmbient2  | proxAmbient3  | proxAmbient5  | proxAmbient6  | proxAmbient7  | selector
+        // id=6 | proxAmbient4  | goundAmbient0 | goundAmbient1 | goundAmbient2 | goundAmbient3 | accZ          | battery       | free byte
+
+        switch((int)((unsigned char)RX_buffer[0])) {
+
+            case 3:
+                proxValue[0] = ((signed int)RX_buffer[2]<<8)|(unsigned char)RX_buffer[1];
+                proxValue[1] = ((signed int)RX_buffer[4]<<8)|(unsigned char)RX_buffer[3];
+                proxValue[2] = ((signed int)RX_buffer[6]<<8)|(unsigned char)RX_buffer[5];
+                proxValue[3] = ((signed int)RX_buffer[8]<<8)|(unsigned char)RX_buffer[7];
+                proxValue[5] = ((signed int)RX_buffer[10]<<8)|(unsigned char)RX_buffer[9];
+                proxValue[6] = ((signed int)RX_buffer[12]<<8)|(unsigned char)RX_buffer[11];
+                proxValue[7] = ((signed int)RX_buffer[14]<<8)|(unsigned char)RX_buffer[13];
+                flags = (unsigned char)RX_buffer[15];
+                break;
+
+            case 4:
+                proxValue[4] = ((signed int)RX_buffer[2]<<8)|(unsigned char)RX_buffer[1];
+                groundValue[0] = ((signed int)RX_buffer[4]<<8)|(unsigned char)RX_buffer[3];
+                groundValue[1] = ((signed int)RX_buffer[6]<<8)|(unsigned char)RX_buffer[5];
+                groundValue[2] = ((signed int)RX_buffer[8]<<8)|(unsigned char)RX_buffer[7];
+                groundValue[3] = ((signed int)RX_buffer[10]<<8)|(unsigned char)RX_buffer[9];
+                accX = (int)((RX_buffer[12]<<8)|(RX_buffer[11]));
+                accY = (int)((RX_buffer[14]<<8)|(RX_buffer[13]));
+                tvRemote = (unsigned char)RX_buffer[15];
+                break;
+
+            case 5:
+                proxValueAmbient[0] = ((signed int)RX_buffer[2]<<8)|(unsigned char)RX_buffer[1];
+                proxValueAmbient[1] = ((signed int)RX_buffer[4]<<8)|(unsigned char)RX_buffer[3];
+                proxValueAmbient[2] = ((signed int)RX_buffer[6]<<8)|(unsigned char)RX_buffer[5];
+                proxValueAmbient[3] = ((signed int)RX_buffer[8]<<8)|(unsigned char)RX_buffer[7];
+                proxValueAmbient[5] = ((signed int)RX_buffer[10]<<8)|(unsigned char)RX_buffer[9];
+                proxValueAmbient[6] = ((signed int)RX_buffer[12]<<8)|(unsigned char)RX_buffer[11];
+                proxValueAmbient[7] = ((signed int)RX_buffer[14]<<8)|(unsigned char)RX_buffer[13];
+                selector = (unsigned char)RX_buffer[15];
+                break;
+
+            case 6:
+                proxValueAmbient[4] = ((signed int)RX_buffer[2]<<8)|(unsigned char)RX_buffer[1];
+                groundValueAmbient[0] = ((signed int)RX_buffer[4]<<8)|(unsigned char)RX_buffer[3];
+                groundValueAmbient[1] = ((signed int)RX_buffer[6]<<8)|(unsigned char)RX_buffer[5];
+                groundValueAmbient[2] = ((signed int)RX_buffer[8]<<8)|(unsigned char)RX_buffer[7];
+                groundValueAmbient[3] = ((signed int)RX_buffer[10]<<8)|(unsigned char)RX_buffer[9];
+                accZ = (int)((RX_buffer[12]<<8)|(RX_buffer[11]));
+                batteryLevel = ((signed int)RX_buffer[14]<<8)|(unsigned char)RX_buffer[13];
+                // RX_buffer[15] is free
+                break;
+
+            case 7:
+                leftMotSteps = ((signed long)((unsigned char)RX_buffer[4]<<24)| ((unsigned char)RX_buffer[3]<<16)| ((unsigned char)RX_buffer[2]<<8)|((unsigned char)RX_buffer[1]));
+                rightMotSteps = ((signed long)((unsigned char)RX_buffer[8]<<24)| ((unsigned char)RX_buffer[7]<<16)| ((unsigned char)RX_buffer[6]<<8)|((unsigned char)RX_buffer[5]));
+                //rightMotSteps = (long int)((RX_buffer[8]<<24)| (RX_buffer[7]<<16)| (RX_buffer[6]<<8)|(RX_buffer[5]));
+                break;
+
+        }
+
+        if(batteryLevel >= 934) {           // 934 is the measured adc value when the battery is charged
+            batteryPercent = 100;
+        } else if(batteryLevel <= 780) {    // 780 is the measrued adc value when the battery is discharged
+            batteryPercent = 0;
+        } else {
+            batteryPercent = (unsigned int)((float)((batteryLevel-780.0)/(934.0-780.0))*100.0);
+        }
+
+        angle = computeAngle(accX, accY);
+
+        counter++;
+
+#ifdef __linux__
+	refresh();
+#endif
+
+#ifdef __APPLE__
+		refresh();
+#endif
+
+#ifdef _WIN32
+        //system( "cls" );
+        //printf("\033[2J");
+        curPos(0,0);
+#endif
+        printf("*****************************\n\r");
+        printf("*** RECEPTION robot -> pc ***\t\tPress h for help\n\r");
+        printf("*****************************\n\r");
+        printf("PROXIMITY\r\n");
+        printf("Prox0\t Prox1\t Prox2\t Prox3\t Prox4\t Prox5\t Prox6\t Prox7\r\n");
+        printf("%4d\t %4d\t %4d\t %4d\t %4d\t %4d\t %4d\t %4d\t\n\r\n", proxValue[0], proxValue[1], proxValue[2], proxValue[3], proxValue[4], proxValue[5], proxValue[6], proxValue[7]);
+        printf("PROXIMITY AMBIENT\r\n");
+        printf("Prox0\t Prox1\t Prox2\t Prox3\t Prox4\t Prox5\t Prox6\t Prox7\r\n");
+        printf("%4d\t %4d\t %4d\t %4d\t %4d\t %4d\t %4d\t %4d\t\n\r\n", proxValueAmbient[0], proxValueAmbient[1], proxValueAmbient[2], proxValueAmbient[3], proxValueAmbient[4], proxValueAmbient[5], proxValueAmbient[6], proxValueAmbient[7]);
+        printf("GROUND\r\n");
+        printf("ground0\t ground1\t ground2\t ground3\r\n");
+        printf("%4d\t %4d\t\t %4d\t\t %4d\t\n\r\n", groundValue[0], groundValue[1], groundValue[2], groundValue[3]);
+        printf("GROUND AMBIENT\r\n");
+        printf("ground0\t ground1\t ground2\t ground3\r\n");
+        printf("%4d\t %4d\t\t %4d\t\t %4d\t\n\r\n", groundValueAmbient[0], groundValueAmbient[1], groundValueAmbient[2], groundValueAmbient[3]);
+        printf("ACCELEROMETER\r\n");
+        printf("X:%4d\t Y:%4d\t Z:%4d\t\r\n", accX, accY, accZ);
+        printf("angle: %3d degrees (on vertical wall)\n\r\n", angle);
+        printf("BATTERY\r\n");
+        printf("adc: %4d (~%3d%%)\n\r\n", batteryLevel, batteryPercent);
+        printf("FLAGS\r\n");
+        if(flags==0) {
+            printf("0x00\n\r\n");
+        } else {
+            printf("%#.2x\n\r\n", flags);
+        }
+        printf("TV REMOTE\r\n");
+        printf("%.2d\n\r\n", tvRemote);
+        printf("SELECTOR\r\n");
+        printf("%.2d\n\r\n", selector);
+        printf("MOTORS ENCODERS\r\n");
+        printf("l: %+.10ld r: %+.10ld\n\r\n", leftMotSteps, rightMotSteps);
+        printf("****************************\n\r");
+        printf("*** TRANSFER robot <- pc ***\n\r");
+        printf("****************************\n\r");
+		printf("SPEED\r\n");
+		printf("speed to send: %+3d\t\n", current_speed);
+		printf("right: %+3d\t left: %+3d\t\n\r\n", rspeed, lspeed);
+		printf("RGB LEDS\r\n");
+		printf("r: %3d\t g: %3d\t b: %3d\t\n\r\n", redLed, greenLed, blueLed);
+        printf("FLAGS\r\n");
+        if(flagsTx==0) {
+            printf("0x00\n\r\n");
+        } else {
+            printf("%#.2x\n\r\n", flagsTx);
+        }
+        printf("COUNTER\r\n");
+        printf("%ld\r\n", counter);
+
+        CALIBRATION_OFF(flagsTx);   // calibration done once
+
+        sleepOn=0;                  // goto sleep once
+        SLEEP_OFF(flagsTx);
+
+        //flagsTx = 0;              // used for debugging controller (changing controller parameters)
+
+    }
+
+	libusb_release_interface(devh, 0);
+	libusb_close(devh);
+	libusb_exit(NULL);
+
+	return 0;
+
+}
+
